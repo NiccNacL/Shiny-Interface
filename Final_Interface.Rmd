@@ -1,0 +1,197 @@
+---
+title: "GSB503PYTEST"
+author: "Joseph Willemsz"
+date: "2/26/2022"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r message=F}
+source_python("rek_output.py")
+```
+
+```{r}
+read_csv("rek_output.csv")
+```
+
+# Libraries 
+```{r, message=FALSE}
+# for Models 
+library(knitr)
+library(reticulate)
+library(rmdformats)
+library(tidytext)
+library(tidymodels)
+library(themis)
+library(hardhat)
+library(textrecipes)
+library(rpart.plot)
+library(discrim)
+library(baguette)
+library(vip)
+library(janitor)
+library(caret)
+library(rlang)
+library(readxl)
+
+# for Interface
+library(DT)
+library(shiny)
+library(shinydashboard)
+library(shinyWidgets)
+library(tidyverse)
+library(glmnet)
+```
+
+
+# Models 
+```{r}
+lasso_model <- readRDS("lasso.rds")
+final_model <- readRDS("final_tree.rds")
+```
+
+
+# Final interface
+```{r}
+rm(ui)
+rm(server)
+
+# Define User Interface logic 
+ui <- dashboardPage(   
+  dashboardHeader(title="World Bank ICP"),
+  dashboardSidebar(width = 120,
+                   sidebarMenu(  
+                     menuItem("DataInput",tabName = "DataInput"),      
+                     menuItem("Classification", tabName = "Classification")
+                   )),
+  dashboardBody(
+    tabItems(
+  uiOutput("img"), # Displays World Bank logo
+      tabItem(tabName = "DataInput",
+    # Takes User Input File
+              fileInput('file1', 'Choose file to upload',
+              accept = c(
+                'text/csv',
+                'text/comma-separated-values',
+                'text/tab-separated-values',
+                'text/plain',
+                '.csv',
+                '.tsv'
+              )
+    ),
+    textOutput("text"),
+  actionButton("show", "Is it Done?")
+  ),
+  tabItem(tabName = "Classification", # Displays Final Table 
+               box(DT::dataTableOutput("table"), width = "100%,", status = "primary")
+      )
+    )
+  )
+) 
+
+# Define server logic 
+server <- function(input, output, session) {
+   output$img <- renderUI({
+      tags$img(src = "https://upload.wikimedia.org/wikipedia/commons/thumb/8/87/The_World_Bank_logo.svg/1024px-The_World_Bank_logo.svg.png", height="75%", width="75%") # Displays World Bank logo
+  })
+  
+   output$text <- renderText({"NOTE: Please make sure file has only 6 variables and properly named 'product_image_url', 'name', 'brand', 'product_description', 'price' or else classification will NOT work."})
+   
+   observeEvent(input$show, { # Checks to see if Classification is complete and shows message
+     if (!is.null(predictions()))
+       showNotification("Classification Complete!")
+     else 
+       showNotification("Loading...")
+       
+    })
+   
+    # Takes User Input file 
+    file_data <- reactive({
+    req(input$file1)
+    read.csv(input$file1$datapath, header = TRUE,
+             sep = ",") %>% 
+        select(product_image_url, name, brand, product_description, price) %>% 
+        mutate(price = round(price, 2))
+  })
+  
+  # Uses file and runs Predictive Models
+  predictions <- reactive({
+    req(file_data(), lasso_model)
+    
+    # Runs Lasso Model used to PRedict if the Product is Home Related or not
+    home_data <- cbind(lasso_model %>% predict(file_data()), file_data())
+    
+    home_data <- home_data %>%  #takes first image URL out if there are multiple 
+      mutate(product_image_url = if_else(str_detect(product_image_url,"\\|"),
+                                str_extract(product_image_url,'[^\\|]*(?=\\|)'),
+                                product_image_url)) %>% 
+      select(product_image_url, name, brand, product_description, price, HomeProduct=.pred_class)
+    
+    # Takes just Product Image URLs to be sent to AWS Rek
+    home_data %>% 
+      select(url=product_image_url) %>% 
+      write.csv('lasso_url_data.csv')
+    
+    # Runs Python code needed to use AWS Rek
+    #source_python("rek_output.py")
+   
+    #rek_output <- read.csv("rek_output.csv") # AWS Rek output 
+    
+    predicts <- merge(x=home_data, y=rek_output, by.x="product_image_url", by.y="url")
+    
+    # Runs Final Decision Tree Classification Model
+    final <- cbind(final_model %>% predict(predicts), predicts)
+    final
+  })
+
+  # Outputs Display Table
+  output$table =  DT::renderDataTable(
+    predictions() %>% 
+      mutate(
+        product_image_url = paste0("<img src=\"", product_image_url),# Needed to Display Product Image 
+        product_image_url = paste0(product_image_url, "\" height=\"150\"></img>"), # Needed to Display Product Image 
+        HomeProduct = as.factor(ifelse(HomeProduct==1, "Yes", "No")), 
+        .pred_class = as.factor(ifelse(.pred_class=="furniture_furnishings", "Furniture Furnishings",
+                             ifelse(.pred_class=="glassware_tableware_household_utensils", "Glassware Tableware Household Utensils", 
+                                    ifelse(.pred_class=="household_textiles", "Household Textiles",
+                                           ifelse(.pred_class=="major_household_appliances", "Major Household Appliances",
+                                                  ifelse(.pred_class=="nondurable_household_goods", "Nondurable Household Goods", 
+                                                         ifelse(.pred_class=="small_electric_household_appliances", "Small Electric Household Appliances", "Small Tools Misc Accessories")))))))
+      ) %>% 
+      select(
+        Image=product_image_url, `Home Product` = HomeProduct, Class = .pred_class, Name=name, Brand=brand, Price=price, `Product Description`=product_description
+      ), 
+    escape = FALSE, # Needed to Display Product Image
+    editable = TRUE, # Allows Edits to displayed output table
+    rownames = FALSE,
+    extensions = 'Buttons',
+    selection = 'single',
+    filter = 'top',
+
+    options = list(
+      paging = TRUE,
+      pageLength = 50, 
+      searching = TRUE, # Allows for Column Filters
+      fixedColumns = TRUE,
+      autoWidth = TRUE,
+      ordering = TRUE,
+      scrollX = TRUE,
+      dom = 'Bfrtip',
+      buttons = c('csv', 'excel') # Allows to save Table to CSV or Excel file
+    ),
+
+    class = "display"
+  )
+   # Allows to save Edits when saving as a file
+  observeEvent(input$user_data_cell_edit, {
+    user_data()[input$user_data_cell_edit$row,input$user_data_cell_edit$col] <<- input$user_data_cell_edit$value
+  })
+
+  }
+
+# Run the application 
+shinyApp(ui = ui, server = server)
+```
