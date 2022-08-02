@@ -1,6 +1,6 @@
 ---
-title: "GSB503PYTEST"
-author: "Joseph Willemsz"
+title: "Shiny Interface"
+author: "Nicholas Bias"
 date: "2/26/2022"
 output: html_document
 ---
